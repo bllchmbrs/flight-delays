@@ -1,6 +1,8 @@
 import org.apache.spark.SparkContext._
 import org.apache.spark._
+import org.apache.spark.sql._
 import org.apache.spark.sql.functions._
+import org.apache.spark.sql.expressions.Window
 
 object FlightDelays extends Serializable {
 
@@ -18,27 +20,46 @@ object FlightDelays extends Serializable {
     // http://stackoverflow.com/questions/30359539/accessing-column-names-with-periods-spark-sql-1-3
     sqlContext.createDataFrame(df.rdd,
       org.apache.spark.sql.types.StructType(df.schema.fields.map(sf =>
-        org.apache.spark.sql.types.StructField(sf.name.replace(".", "").replace(" ",""), sf.dataType, sf.nullable)
+        org.apache.spark.sql.types.StructField(sf.name
+          .replace(".", "").replace(" ","")
+          .replace("(","").replace(")","").replace("%",""), sf.dataType, sf.nullable)
       ))
     )
   }
 
-  def genSql(func:String, partitionBy: String, orderBy: String, hours: Int) = {
-    (field:String) => {
-      s" $func(float($field), $hours, 0) over (partition by $partitionBy order by $orderBy) as lag$hours$field "
-    }
+  def generateLag(data: DataFrame, colName: String, nRows: Int) = {
+    val s = s"lag$colName$nRows"
+    val lagWindow = Window
+      .partitionBy("CallSign")
+      .orderBy(data.col("YearMonthDay"), data.col("Time"))
+
+    lag(data.col(colName), nRows).over(lagWindow).alias(s)
+  }
+
+  def generateSum(data: DataFrame, colName: String, nRows:Int) = {
+    val s = s"sum$colName$nRows"
+    val sumWindow1 = Window
+      .partitionBy("CallSign")
+      .orderBy("YearMonthDay", "Time")
+      .rowsBetween(-1 * nRows,0)
+
+      sum(data.col(colName)).over(sumWindow1).alias(s)
   }
 
   def loadWeatherData(sqlContext: org.apache.spark.sql.SQLContext) = {
 
     // load up the data!
-    val rawWeatherData1 = sqlContext.read.format("com.databricks.spark.csv")
+    var rawWeatherData = sqlContext.read.format("com.databricks.spark.csv")
       .option("header","true")
       .load("s3n://b-datasets/weather_data/*hourly.txt")
       .repartition(36)
+    val newWeatherTypes = Map(("WindSpeedkt", "Float"), ("DryBulbTemp", "Float"),
+      ("DewPointTemp", "Float"), ("WetBulbTemp", "Float"),("PrecipTotal", "Float"))
 
-    val rawWeatherData = cleanColumnNames(rawWeatherData1,sqlContext)
+    rawWeatherData = cleanColumnNames(rawWeatherData,sqlContext)
       .withColumnRenamed("WbanNumber", "ID")
+
+    rawWeatherData = convertColumns(rawWeatherData, newWeatherTypes)
 
     val rawStationList = sqlContext.read.format("com.databricks.spark.csv")
       .option("header","true")
@@ -53,6 +74,21 @@ object FlightDelays extends Serializable {
     rawWeatherData
       .join(rawStationList,
         rawWeatherData.col("ID") === rawStationList.col("ID1"), "outer")
+      .drop("ID")
+      .drop("ID1")
+      .drop("StationType")
+      .drop("MaintenanceIndicator")
+      .drop("SkyConditions")
+      .drop("Visibility")
+      .drop("WeatherType")
+      .drop("RelativeHumidity")
+      .drop("WindDirection")
+      .drop("WindCharGustskt")
+      .drop("ValforWindChar")
+      .drop("StationPressure")
+      .drop("PressureTendency")
+      .drop("SeaLevelPressure")
+      .drop("RecordType")
       .repartition(36)
   }
 
@@ -62,25 +98,17 @@ object FlightDelays extends Serializable {
       .read.format("com.databricks.spark.csv")
       .option("header","true")
       .load("s3n://b-datasets/flight_data/*")
-      .repartition(36)
 
     val newFlightTypes = Map(
       ("Year", "int"), ("Month", "int"), ("DayofMonth","int"),
-      ("DayOfWeek","int"), ("ActualElapsedTime","int"),("CRSElapsedTime", "int"),
-      ("AirTime","int"),("ArrDelay","int"),("DepDelay","int"),("Distance","int"),
-      ("TaxiIn","int"),("TaxiOut","int"), ("CarrierDelay", "int"),
-      ("WeatherDelay", "int"), ("NASDelay","int"), ("SecurityDelay","int"),
-      ("LateAircraftDelay","int")
+      ("DayOfWeek","int"), ("WeatherDelay", "int")
     )
 
-    val rawFlightData2 = convertColumns(rawFlightData, newFlightTypes)
-
-    rawFlightData2
-      .withColumn("TotalDelay", rawFlightData2.col("ArrDelay") + rawFlightData2.col("DepDelay"))
+    // just remove all these extra columns to keep things neat
+    convertColumns(rawFlightData, newFlightTypes)
       .drop("LateAircraftDelay")
       .drop("SecurityDelay")
       .drop("NASDelay")
-      .drop("WeatherDelay")
       .drop("CarrierDelay")
       .drop("Diverted")
       .drop("CancellationCode")
@@ -92,6 +120,13 @@ object FlightDelays extends Serializable {
       .drop("ActualElapsedTime")
       .drop("ArrTime")
       .drop("DepTime")
+      .drop("UniqueCarrier")
+      .drop("FlightNum")
+      .drop("TailNum")
+      .drop("ArrDelay")
+      .drop("DepDelay")
+      .drop("Distance")
+      .repartition(36)
   }
 
   def main(args: Array[String]) = {
@@ -99,55 +134,50 @@ object FlightDelays extends Serializable {
     val sc = new SparkContext(conf)
     val sqlContext = new org.apache.spark.sql.SQLContext(sc)
 
-    val weatherData = loadWeatherData(sqlContext).cache()
-    val flightData = loadFlightData(sqlContext).cache()
-    weatherData.registerTempTable("rawWeather")
-    flightData.registerTempTable("rawFlight")
-
-    //lag example
-    sqlContext.sql("""SELECT CallSign, int(PrecipTotal), lag(int(PrecipTotal),1,0)
-    over (partition by CallSign order by YearMonthDay) as lagprecip 
-    FROM rawWeather 
-    WHERE PrecipTotal != null""")
-      .take(400)
-
-    // generate our functions, this is a bit hacky but it works :)
-    val lag1hr = genSql("lag", "CallSign", "(int(YearMonthDay), int(Time))", 1)
-    val lag3hr = genSql("lag", "CallSign", "(int(YearMonthDay), int(Time))", 3)
-    val lag6hr = genSql("lag", "CallSign", "(int(YearMonthDay), int(Time))", 6)
-    val lag12hr = genSql("lag", "CallSign", "(int(YearMonthDay), int(Time))", 12)
-
-    val sum1hr = genSql("sum", "CallSign", "(int(YearMonthDay), int(Time))", 1)
-    val sum3hr = genSql("sum", "CallSign", "(int(YearMonthDay), int(Time))", 3)
-    val sum6hr = genSql("sum", "CallSign", "(int(YearMonthDay), int(Time))", 6)
-    val sum12hr = genSql("sum", "CallSign", "(int(YearMonthDay), int(Time))", 12)
-
-    val weatherManip = Array(
-      "int(trim(regexp_replace(Visibility, 'SM','')))",
-      "int(WeatherType",
-      "int(DryBulbTemp)",
-      "int(DewPointTemp)",
-      "int(WetBulbTemp)",
-      "int(%RelativeHumidity)")
-
-    val weatherLagSum = weatherManip.map(lag1hr) ++ weatherManip.map(lag3hr) ++
-    weatherManip.map(lag6hr) ++ weatherManip.map(lag12hr) ++
-    weatherManip.map(sum1hr) ++ weatherManip.map(sum3hr) ++
-    weatherManip.map(sum6hr) ++ weatherManip.map(sum12hr)
-
-    sqlContext.sql("SELECT CallSign, " + (weatherLagSum).mkString(", ") + ", CallSign FROM rawWeather")
-      .registerTempTable("weather")
-    // is this automatically query optimized?
+  var weatherData = loadWeatherData(sqlContext)
+  var flightData = loadFlightData(sqlContext)
+  weatherData.write.parquet("weatherData.parquet")
+  flightData.write.parquet("flightData.parquet")
+  weatherData = sqlContext.read.parquet("weatherData.parquet").repartition(24)
+  flightData = sqlContext.read.parquet("flightData.parquet").repartition(24)
+  weatherData.cache()
+  flightData.cache()
+  weatherData.registerTempTable("rawWeather")
+  flightData.registerTempTable("rawFlight")
 
 
 
-    sqlContext.sql("SELECT * FROM flight LEFT JOIN weather ON (flight. == weather.ID)").registerTempTable("base")
+    weatherData.select(
+      $"CallSign",
+      $"YearMonthDay",
+      $"Time",
+      $"WindSpeedkt",
+      generateLag(weatherData, "WindSpeedkt", 1),
+      generateSum(weatherData, "WindSpeedkt", 1),
+      generateLag(weatherData, "WindSpeedkt", 3),
+      generateSum(weatherData, "WindSpeedkt", 3),
+      generateLag(weatherData, "WindSpeedkt", 6),
+      generateSum(weatherData, "WindSpeedkt", 6),
+      generateLag(weatherData, "WindSpeedkt", 12),
+      generateSum(weatherData, "WindSpeedkt", 12),
+      generateLag(weatherData, "WindSpeedkt", 24),
+      generateSum(weatherData, "WindSpeedkt", 24),
+      generateLag(weatherData, "WindSpeedkt", 36),
+      generateSum(weatherData, "WindSpeedkt", 36),
+      generateLag(weatherData, "WindSpeedkt", 72),
+      generateSum(weatherData, "WindSpeedkt", 72)
+  ).show
 
 
 
-    // need to convert to LabeledPoint in MLLib
-    // we might need a hashingTF to convert the origins/destinations or something like that. Not exactly sure how to handle it.
-    // this is going to be a like a one hot encoder or something
 
-  }
+  sqlContext.sql("""SELECT CallSign, PrecipTotal, sum(PrecipTotal) over w from rawWeather;
+WINDOW w as (PARTITION BY (YearMonthDay, Time) ORDER BY (YearMonthDay, Time) ROWS BETWEEN 3 PRECEDING AND CURRENT ROW)""")
+
+
+  // need to convert to LabeledPoint in MLLib
+  // we might need a hashingTF to convert the origins/destinations or something like that. Not exactly sure how to handle it.
+  // this is going to be a like a one hot encoder or something
+
+}
 }
