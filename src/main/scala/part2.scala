@@ -23,6 +23,12 @@ object FlightDelays extends Serializable {
     )
   }
 
+  def genSql(func:String, partitionBy: String, orderBy: String, hours: Int) = {
+    (field:String) => {
+      s" $func(float($field), $hours, 0) over (partition by $partitionBy order by $orderBy) as lag$hours$field "
+    }
+  }
+
   def loadWeatherData(sqlContext: org.apache.spark.sql.SQLContext) = {
 
     // load up the data!
@@ -40,13 +46,13 @@ object FlightDelays extends Serializable {
       .load("s3n://b-datasets/weather_data/*station.txt")
       .distinct
       .select("Call Sign","WBAN Number")
-      .withColumnRenamed("WBAN Number", "ID")
+      .withColumnRenamed("WBAN Number", "ID1")
       .withColumnRenamed("Call Sign", "CallSign")
     // we are assuming that the station names/locations haven't changed since we're grabbing distinct
 
     rawWeatherData
       .join(rawStationList,
-        rawWeatherData.col("ID") === rawStationList.col("ID"), "outer")
+        rawWeatherData.col("ID") === rawStationList.col("ID1"), "outer")
       .repartition(36)
   }
 
@@ -95,19 +101,47 @@ object FlightDelays extends Serializable {
 
     val weatherData = loadWeatherData(sqlContext).cache()
     val flightData = loadFlightData(sqlContext).cache()
-    weatherData.registerTempTable("weather")
-    flightData.registerTempTable("flight")
+    weatherData.registerTempTable("rawWeather")
+    flightData.registerTempTable("rawFlight")
 
     //lag example
+    sqlContext.sql("""SELECT CallSign, int(PrecipTotal), lag(int(PrecipTotal),1,0)
+    over (partition by CallSign order by YearMonthDay) as lagprecip 
+    FROM rawWeather 
+    WHERE PrecipTotal != null""")
+      .take(400)
 
-  sqlContext.sql("SELECT CallSign, int(PrecipTotal), lag(int(PrecipTotal),1,0) over (partition by CallSign order by YearMonthDay) as lagprecip from weather where PrecipTotal != null").take(400)
+    // generate our functions, this is a bit hacky but it works :)
+    val lag1hr = genSql("lag", "CallSign", "(int(YearMonthDay), int(Time))", 1)
+    val lag3hr = genSql("lag", "CallSign", "(int(YearMonthDay), int(Time))", 3)
+    val lag6hr = genSql("lag", "CallSign", "(int(YearMonthDay), int(Time))", 6)
+    val lag12hr = genSql("lag", "CallSign", "(int(YearMonthDay), int(Time))", 12)
+
+    val sum1hr = genSql("sum", "CallSign", "(int(YearMonthDay), int(Time))", 1)
+    val sum3hr = genSql("sum", "CallSign", "(int(YearMonthDay), int(Time))", 3)
+    val sum6hr = genSql("sum", "CallSign", "(int(YearMonthDay), int(Time))", 6)
+    val sum12hr = genSql("sum", "CallSign", "(int(YearMonthDay), int(Time))", 12)
+
+    val weatherManip = Array(
+      "int(trim(regexp_replace(Visibility, 'SM','')))",
+      "int(WeatherType",
+      "int(DryBulbTemp)",
+      "int(DewPointTemp)",
+      "int(WetBulbTemp)",
+      "int(%RelativeHumidity)")
+
+    val weatherLagSum = weatherManip.map(lag1hr) ++ weatherManip.map(lag3hr) ++
+    weatherManip.map(lag6hr) ++ weatherManip.map(lag12hr) ++
+    weatherManip.map(sum1hr) ++ weatherManip.map(sum3hr) ++
+    weatherManip.map(sum6hr) ++ weatherManip.map(sum12hr)
+
+    sqlContext.sql("SELECT CallSign, " + (weatherLagSum).mkString(", ") + ", CallSign FROM rawWeather")
+      .registerTempTable("weather")
+    // is this automatically query optimized?
 
 
-    // backticks for column names
 
-    // now we need to lag that data
-    // we can perform some exploratory data analysis here as well
-
+    sqlContext.sql("SELECT * FROM flight LEFT JOIN weather ON (flight. == weather.ID)").registerTempTable("base")
 
 
 
