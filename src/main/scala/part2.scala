@@ -1,12 +1,11 @@
-import org.apache.spark.SparkContext._
-import org.apache.spark._
-import org.apache.spark.sql._
-import org.apache.spark.sql.functions._
+import org.apache.spark.{SparkContext, SparkConf}
+import org.apache.spark.sql.{DataFrame, Column}
+import org.apache.spark.sql.functions.{lag, avg, sum, udf}
 import org.apache.spark.sql.expressions.Window
 
 object FlightDelays extends Serializable {
 
-  def convertColumns(df: org.apache.spark.sql.DataFrame, colTypeMap: Map[String, String]) = {
+  def convertColumns(df: DataFrame, colTypeMap: Map[String, String]) = {
     var localDf = df
     for (Tuple2(column, newType) <- colTypeMap.iterator) {
       localDf = localDf.withColumn(column, localDf.col(column).cast(newType))
@@ -58,27 +57,9 @@ object FlightDelays extends Serializable {
 
   def loadWeatherData(sqlContext: org.apache.spark.sql.SQLContext) = {
 
-    val makeDate = udf( (ymd: String, time:String, tz:String) => {
-      val y = ymd.slice(0,4)
-      val m = ymd.slice(4,6)
-      val d = ymd.slice(6,8)
-      val h = time.slice(0,2)
-      val mm = time.slice(2,4)
-      val hrs = tz.split("\\.")(0).toFloat
-      val mins = ("0." + tz.split("\\.")(1)).toFloat * 60
-      s"$y-$m-$d" + "T" + s"$h:$mm" + "+" + hrs + ":" + mins
-    })
-
     var rawWeatherData = sqlContext.read.format("com.databricks.spark.csv")
       .option("header","true")
       .load("s3n://b-datasets/weather_data/*hourly.txt")
-
-    var airportMeta = sqlContext.read.format("com.databricks.spark.csv").load("s3n://b-datasets/airports.csv")
-
-    Array("ID","NAME","CITY","COUNTRY","FAA","ICAO","LAT","LON","ALT","TZ","DST","TZ2").zipWithIndex.foreach { x =>
-      val (name, cur) = x
-      airportMeta = airportMeta.withColumnRenamed(s"C$cur", name)
-    }
 
     rawWeatherData = cleanColumnNames(rawWeatherData, sqlContext)
       .withColumnRenamed("WbanNumber", "ID")
@@ -86,25 +67,7 @@ object FlightDelays extends Serializable {
     val newWeatherTypes = Map(("WindSpeedkt", "Float"), ("DryBulbTemp", "Float"),
       ("DewPointTemp", "Float"), ("WetBulbTemp", "Float"),("PrecipTotal", "Float"))
 
-    rawWeatherData = convertColumns(rawWeatherData, newWeatherTypes)
-
-    val rawStationList = sqlContext.read.format("com.databricks.spark.csv")
-      .option("header","true")
-      .option("delimiter","|")
-      .load("s3n://b-datasets/weather_data/*station.txt")
-      .distinct
-      .select("Call Sign","WBAN Number")
-      .withColumnRenamed("WBAN Number", "ID1")
-      .withColumnRenamed("Call Sign", "CallSign")
-    // we are assuming that the station names/locations haven't changed since we're grabbing distinct
-
-    rawWeatherData = rawWeatherData
-      .join(rawStationList,
-        rawWeatherData.col("ID") === rawStationList.col("ID1"), "outer")
-
-    rawWeatherData
-      .drop("ID")
-      .drop("ID1")
+    convertColumns(rawWeatherData, newWeatherTypes)
       .drop("StationType")
       .drop("MaintenanceIndicator")
       .drop("SkyConditions")
@@ -118,18 +81,9 @@ object FlightDelays extends Serializable {
       .drop("PressureTendency")
       .drop("SeaLevelPressure")
       .drop("RecordType")
-      .repartition(24)
   }
 
   def loadFlightData(sqlContext: org.apache.spark.sql.SQLContext) = {
-
-    val makeDate = udf( (y: String, m:String, d:String, time:String, tz:String) => {
-      val h = time.slice(0,2)
-      val mm = time.slice(2,4)
-      val hrs = tz.split("\\.")(0).toFloat
-      val mins = ("0." + tz.split("\\.")(1)).toFloat * 60
-      s"$y-$m-$d" + "T" + s"$h:$mm" + "+" + hrs + ":" + mins
-    })
 
     var rawFlightData = sqlContext
       .read.format("com.databricks.spark.csv")
@@ -138,19 +92,7 @@ object FlightDelays extends Serializable {
 
     val newFlightTypes = Map(("WeatherDelay", "int"))
 
-    var airportMeta = sqlContext.read.format("com.databricks.spark.csv").load("s3n://b-datasets/airports.csv")
-
-    Array("ID","NAME","CITY","COUNTRY","FAA","ICAO","LAT","LON","ALT","TZ","DST","TZ2").zipWithIndex.foreach { x =>
-      val (name, cur) = x
-      airportMeta = airportMeta.withColumnRenamed(s"C$cur", name)
-    }
-
-    // just remove all these extra columns to keep things neat
-    rawFlightData = convertColumns(rawFlightData, newFlightTypes)
-      .join(airportMeta.select($"FAA",$"TZ"),
-        airportMeta.col("FAA") === rawFlightData.col("Origin"), "outer")
-
-    rawFlightData
+    convertColumns(rawFlightData, newFlightTypes)
       .drop("LateAircraftDelay")
       .drop("SecurityDelay")
       .drop("NASDelay")
@@ -172,24 +114,111 @@ object FlightDelays extends Serializable {
       .drop("DepDelay")
       .drop("Distance")
       .drop("DayOfWeek")
-      .repartition(24)
   }
 
-  // def main(args: Array[String]) = {
-  //   val conf = new SparkConf().setAppName("FlightDelayPredictor")
-  //   val sc = new SparkContext(conf)
-  //   val sqlContext = new org.apache.spark.sql.SQLContext(sc)
+  def loadAirportMeta(sqlContext: org.apache.spark.sql.SQLContext) = {
 
+    var airportMeta = sqlContext.read.format("com.databricks.spark.csv").load("s3n://b-datasets/airports.csv")
+    Array("ID","NAME","CITY","COUNTRY","FAA","ICAO","LAT","LON","ALT","TZ","DST","TZ2").zipWithIndex.foreach { x =>
+      val (name, cur) = x
+      airportMeta = airportMeta.withColumnRenamed(s"C$cur", name)
+    }
+    airportMeta.select($"FAA",$"TZ")
+  }
+
+  
+  def processHr(hr:String) = {
+    if (hr.length == 3) hr
+    else if (hr.length == 2 && !hr.charAt(0).isDigit) hr.charAt(0) + "0" + hr.charAt(1)
+    else if (hr.length == 2) "+" + hr
+    else "+0" + hr
+  }
+
+  def processMin(min:String) = if (min.length == 1) "0" + min else min
+
+  def toUTCFmt(tz: String) = {
+    val splitted = tz.split("\\.")
+    if (splitted.length == 2) {
+      processHr(splitted(0)) +  ":" + processMin((splitted(1).toInt * 6).toString)
+    } else {
+      processHr(splitted(0))
+    }
+  }
+
+
+
+  def main(args: Array[String]) = {
+    val conf = new SparkConf().setAppName("FlightDelayPredictor")
+    val sc = new SparkContext(conf)
+    val sqlContext = new org.apache.spark.sql.SQLContext(sc)
+   
+    val mdt1 = udf((ymd: String, time:String, tz:String) => {
+      val y = ymd.slice(0,4)
+      val m = ymd.slice(4,6)
+      val d = ymd.slice(6,8)
+      val h = time.slice(0,2)
+      val mm = time.slice(2,4)
+      val utc = utcAbbrs.value(toUTCFmt(tz)).toString
+      s"$y-$m-$d " + s"$h:$mm " + s"$utc"
+    })
+
+    val mdt2 = udf((y: String, m:String, d:String, time:String, tz:String) => {
+      val h = time.slice(0,2)
+      val mm = time.slice(2,4)
+      val utc = utcAbbrs.value(toUTCFmt(tz)).toString
+      s"$y-$m-$d " + s"$h:$mm " + s"$utc"
+    })
+
+    val utcabbr = sqlContext.read.format("com.databricks.spark.csv")
+      .option("header","true")
+      .load("s3n://b-datasets/utcabbrs.csv")
+    val utcAbbrs = sc.broadcast(Map[String, String]() ++ utcabbr.map(x => (x(1), x(0))).collect)
+
+
+    // load up our broadcast variables
+    val stationMeta = sqlContext.read.format("com.databricks.spark.csv")
+      .option("header","true")
+      .option("delimiter","|")
+      .load("s3n://b-datasets/weather_data/*station.txt")
+      .distinct
+      .select("Call Sign","WBAN Number")
+      .withColumnRenamed("WBAN Number", "ID1")
+      .withColumnRenamed("Call Sign", "CallSign")
+
+    var airportMeta = loadAirportMeta(sqlContext)
+    airportMeta = airportMeta
+      .join(utcabbr, airportMeta.col("FAA") === utcabbr.col("Abbr"), "inner")
+    airportMeta = airportMeta
+      .join(stationMeta, airportMeta.col("FAA") === stationMeta.col("CallSign"), "inner")
+      .drop("FAA")
+      .drop("Abbr")
+      .cache()
+
+
+    val dtfmt = "yyyy-MM-dd hh:mm z"
+
+    // Load it into hdfs for faster usage
     var weatherData = loadWeatherData(sqlContext)
     var flightData = loadFlightData(sqlContext)
-    weatherData.write.parquet("weatherData.parquet")
-    flightData.write.parquet("flightData.parquet")
-    var weatherData = sqlContext.read.parquet("weatherData.parquet").repartition(24)
-    var flightData = sqlContext.read.parquet("flightData.parquet").repartition(24)
+    weatherData.repartition(12).write.parquet("weatherData.parquet")
+    flightData.repartition(12).write.parquet("flightData.parquet")
+
+    weatherData = sqlContext.read.parquet("weatherData.parquet").repartition(24)
     weatherData.cache()
-    flightData.cache()
     weatherData.registerTempTable("rawWeather")
+    flightData = sqlContext.read.parquet("flightData.parquet").repartition(24)
+    flightData.cache()
     flightData.registerTempTable("rawFlight")
+
+    var fd = flightData
+    fd = fd
+      .join(airportMeta, fd.col("Origin") === airportMeta.col("CallSign"), "inner")
+    fd= fd
+    .withColumn("d2", mdt2(fd.col("Year"), fd.col("Month"), fd.col("DayofMonth"), fd.col("CRSDepTime"), fd.col("TZ")))
+
+
+
+
 
 
 
@@ -252,8 +281,6 @@ object FlightDelays extends Serializable {
       generateAvg(weatherData, "WetBulbTemp", 36),
       generateAvg(weatherData, "WetBulbTemp", 72)
     ).show
-
-
 
     // need to convert to LabeledPoint in MLLib
 
